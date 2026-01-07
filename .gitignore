@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.parquet
+*.mp4
+converted_*/
+output_*/
