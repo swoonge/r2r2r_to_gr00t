@@ -11,20 +11,37 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
+DEFAULT_INPUT_ROOTS = {
+    "yumi": Path("/home/vision/Sim2Real_Data_Augmentation_for_VLA/yumi_coffee_maker/successes"),
+    "franka": Path("/home/vision/Sim2Real_Data_Augmentation_for_VLA/franka_coffee_maker/successes"),
+}
+
+DEFAULT_OUTPUT_ROOTS = {
+    "yumi": Path("/home/vision/Sim2Real_Data_Augmentation_for_VLA/r2r2r_to_gr00t/converted_yumi"),
+    "franka": Path("/home/vision/Sim2Real_Data_Augmentation_for_VLA/r2r2r_to_gr00t/converted_franka"),
+}
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert r2r2r YuMi data to GR00T LeRobot v2 format.")
+    parser = argparse.ArgumentParser(description="Convert r2r2r data to GR00T LeRobot v2 format.")
+    parser.add_argument(
+        "--robot",
+        type=str,
+        default="yumi",
+        choices=sorted(DEFAULT_INPUT_ROOTS.keys()),
+        help="Robot type used to select joint ordering and modality grouping.",
+    )
     parser.add_argument(
         "--input-root",
         type=Path,
-        default=Path("/home/vision/Sim2Real_Data_Augmentation_for_VLA/yumi_coffee_maker/successes"),
-        help="Root folder containing env_* episode directories.",
+        default=None,
+        help="Root folder containing env_* episode directories. Defaults depend on --robot.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/home/vision/Sim2Real_Data_Augmentation_for_VLA/r2r2r_to_gr00t/converted_yumi"),
-        help="Output dataset root.",
+        default=None,
+        help="Output dataset root. Defaults depend on --robot.",
     )
     parser.add_argument(
         "--task",
@@ -100,17 +117,38 @@ def list_episode_dirs(input_root: Path) -> list[Path]:
     return episode_dirs
 
 
-def build_joint_order(joint_names: list[str]) -> tuple[list[int], list[str]]:
-    left_idxs = [
-        i for i, name in enumerate(joint_names) if name.endswith("_l") and "gripper" not in name
-    ]
-    right_idxs = [
-        i for i, name in enumerate(joint_names) if name.endswith("_r") and "gripper" not in name
-    ]
-    gripper_idxs = [i for i, name in enumerate(joint_names) if "gripper" in name]
-    ordered = left_idxs + right_idxs + gripper_idxs
-    ordered_names = [joint_names[i] for i in ordered]
-    return ordered, ordered_names
+def build_joint_order_and_groups(
+    joint_names: list[str], robot: str
+) -> tuple[list[int], list[str], list[str], list[int]]:
+    if robot == "yumi":
+        left_idxs = [
+            i for i, name in enumerate(joint_names) if name.endswith("_l") and "gripper" not in name
+        ]
+        right_idxs = [
+            i for i, name in enumerate(joint_names) if name.endswith("_r") and "gripper" not in name
+        ]
+        gripper_idxs = [i for i, name in enumerate(joint_names) if "gripper" in name]
+        ordered = left_idxs + right_idxs + gripper_idxs
+        ordered_names = [joint_names[i] for i in ordered]
+        group_names = ["left_arm", "right_arm", "gripper"]
+        group_sizes = [len(left_idxs), len(right_idxs), len(gripper_idxs)]
+        return ordered, ordered_names, group_names, group_sizes
+
+    if robot == "franka":
+        gripper_idxs = [
+            i for i, name in enumerate(joint_names) if "finger" in name or "gripper" in name
+        ]
+        if not gripper_idxs:
+            # Fallback: treat the last joint as gripper if naming is missing.
+            gripper_idxs = [len(joint_names) - 1]
+        arm_idxs = [i for i in range(len(joint_names)) if i not in gripper_idxs]
+        ordered = arm_idxs + gripper_idxs
+        ordered_names = [joint_names[i] for i in ordered]
+        group_names = ["arm", "gripper"]
+        group_sizes = [len(arm_idxs), len(gripper_idxs)]
+        return ordered, ordered_names, group_names, group_sizes
+
+    raise ValueError(f"Unsupported robot type: {robot}")
 
 
 def load_joint_names(joint_names_path: Path) -> list[str]:
@@ -172,10 +210,25 @@ def ffmpeg_encode(
     subprocess.run(cmd, check=True)
 
 
+def build_group_slices(group_names: list[str], group_sizes: list[int]) -> dict[str, dict[str, int]]:
+    slices: dict[str, dict[str, int]] = {}
+    start = 0
+    for name, size in zip(group_names, group_sizes):
+        end = start + size
+        slices[name] = {"start": start, "end": end}
+        start = end
+    return slices
+
+
 def main() -> None:
     args = parse_args()
     if len(args.camera_keys) != len(args.camera_names):
         raise ValueError("camera-keys and camera-names must have same length")
+
+    if args.input_root is None:
+        args.input_root = DEFAULT_INPUT_ROOTS[args.robot]
+    if args.output_root is None:
+        args.output_root = DEFAULT_OUTPUT_ROOTS[args.robot]
 
     episode_dirs = list_episode_dirs(args.input_root)
     if args.max_episodes is not None:
@@ -194,7 +247,11 @@ def main() -> None:
 
     # Joint order and names from first episode
     first_joint_names = load_joint_names(episode_dirs[0] / "robot_data" / "joint_names.txt")
-    joint_order, ordered_joint_names = build_joint_order(first_joint_names)
+    joint_order, ordered_joint_names, group_names, group_sizes = build_joint_order_and_groups(
+        first_joint_names, args.robot
+    )
+    if not joint_order:
+        raise ValueError(f"No joints selected for robot={args.robot}; check joint name parsing.")
 
     # Determine image shape
     sample_image = (
@@ -294,16 +351,17 @@ def main() -> None:
             f.write(json.dumps(ep) + "\n")
 
     # info.json
+    total_dim = len(ordered_joint_names)
     features = {
         "observation.state": {
             "dtype": "float32",
             "names": ordered_joint_names,
-            "shape": [len(ordered_joint_names)],
+            "shape": [total_dim],
         },
         "action": {
             "dtype": "float32",
             "names": ordered_joint_names,
-            "shape": [len(ordered_joint_names)],
+            "shape": [total_dim],
         },
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},
         "frame_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -331,7 +389,7 @@ def main() -> None:
 
     info = {
         "codebase_version": "v2.1",
-        "robot_type": "yumi",
+        "robot_type": args.robot,
         "total_episodes": len(episodes_meta),
         "total_frames": sum(ep["length"] for ep in episodes_meta),
         "total_tasks": 1,
@@ -349,16 +407,8 @@ def main() -> None:
 
     # modality.json
     modality = {
-        "state": {
-            "left_arm": {"start": 0, "end": 7},
-            "right_arm": {"start": 7, "end": 14},
-            "gripper": {"start": 14, "end": 16},
-        },
-        "action": {
-            "left_arm": {"start": 0, "end": 7},
-            "right_arm": {"start": 7, "end": 14},
-            "gripper": {"start": 14, "end": 16},
-        },
+        "state": build_group_slices(group_names, group_sizes),
+        "action": build_group_slices(group_names, group_sizes),
         "video": {
             cam_name: {"original_key": f"observation.images.{cam_name}"}
             for cam_name in args.camera_names
